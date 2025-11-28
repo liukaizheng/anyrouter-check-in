@@ -1,0 +1,8 @@
+.claude
+.env
+.venv
+__pycache__
+.pytest_cache
+.ruff_cache
+target
+balance_hash.txt
