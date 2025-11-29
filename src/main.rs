@@ -321,11 +321,20 @@ async fn check_in_account(
     headers.insert(header::ORIGIN, "https://anyrouter.top".parse().unwrap());
     headers.insert("new-api-user", api_user.parse().unwrap());
 
-    let user_info = get_user_info(&client, &headers).await;
+    // Fetch account info before check-in (may fail; non-fatal)
+    let mut user_info = get_user_info(&client, &headers).await;
     if user_info.success {
-        log_account("BALANCE", &account_name, &user_info.display);
+        log_account(
+            "BALANCE",
+            &account_name,
+            format!("pre check-in - {}", user_info.display),
+        );
     } else if let Some(ref error) = user_info.error {
-        log_account("WARN", &account_name, error);
+        log_account(
+            "WARN",
+            &account_name,
+            format!("unable to fetch account info before check-in: {}", error),
+        );
     }
 
     log_account(
@@ -371,6 +380,27 @@ async fn check_in_account(
                                 &account_name,
                                 "check-in completed successfully",
                             );
+
+                            // Attempt to refresh account info after a successful check-in
+                            let post_user_info = get_user_info(&client, &headers).await;
+                            if post_user_info.success {
+                                log_account(
+                                    "BALANCE",
+                                    &account_name,
+                                    format!("post check-in - {}", post_user_info.display),
+                                );
+                                user_info = post_user_info;
+                            } else if let Some(ref error) = post_user_info.error {
+                                log_account(
+                                    "WARN",
+                                    &account_name,
+                                    format!(
+                                        "unable to fetch account info after check-in: {}",
+                                        error
+                                    ),
+                                );
+                            }
+
                             (true, Some(user_info))
                         } else {
                             let error_msg = result
