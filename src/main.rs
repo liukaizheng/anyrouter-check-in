@@ -3,6 +3,7 @@ mod notify;
 use anyhow::{anyhow, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chrono::Local;
+use colored::Colorize;
 use futures::StreamExt;
 use notify::NotificationKit;
 use reqwest::{cookie::Jar, header, Client};
@@ -14,6 +15,34 @@ use std::env;
 use std::fs;
 use std::process;
 use std::sync::Arc;
+
+fn format_tag(tag: &str) -> String {
+    match tag {
+        "SYSTEM" => "[SYSTEM]".bold().blue().to_string(),
+        "TIME" => "[TIME]".bold().bright_black().to_string(),
+        "INFO" => "[INFO]".bold().cyan().to_string(),
+        "ACCOUNT" => "[ACCOUNT]".bold().magenta().to_string(),
+        "HTTP" => "[HTTP]".bold().yellow().to_string(),
+        "SUCCESS" => "[SUCCESS]".bold().green().to_string(),
+        "ERROR" => "[ERROR]".bold().red().to_string(),
+        "WARN" => "[WARN]".bold().yellow().to_string(),
+        "NOTIFY" => "[NOTIFY]".bold().purple().to_string(),
+        "STATS" => "[STATS]".bold().blue().to_string(),
+        "BALANCE" => "[BALANCE]".bold().bright_yellow().to_string(),
+        _ => format!("[{}]", tag),
+    }
+}
+
+fn log_line(tag: &str, message: impl AsRef<str>) {
+    println!("{} {}", format_tag(tag), message.as_ref());
+}
+
+fn log_account(tag: &str, account_name: &str, message: impl AsRef<str>) {
+    log_line(
+        tag,
+        format!("account {} - {}", account_name, message.as_ref()),
+    );
+}
 
 const BALANCE_HASH_FILE: &str = "balance_hash.txt";
 
@@ -66,6 +95,9 @@ fn generate_balance_hash(balances: &HashMap<String, BalanceInfo>) -> String {
     let simple_balances: HashMap<String, f64> =
         balances.iter().map(|(k, v)| (k.clone(), v.quota)).collect();
 
+    // Using `unwrap` here is acceptable because `simple_balances` only contains
+    // `String` keys and `f64` values and is fully under our control. If this ever
+    // changes, consider turning this into a `Result<String>`.
     let balance_json = serde_json::to_string(&simple_balances).unwrap();
     let mut hasher = Sha256::new();
     hasher.update(balance_json.as_bytes());
@@ -81,9 +113,10 @@ fn get_account_display_name(account_info: &AccountInfo, account_index: usize) ->
 }
 
 async fn get_waf_cookies_with_playwright(account_name: &str) -> Result<HashMap<String, String>> {
-    println!(
-        "[PROCESSING] {}: Starting browser to get WAF cookies...",
-        account_name
+    log_account(
+        "ACCOUNT",
+        account_name,
+        "starting browser to obtain WAF cookies",
     );
 
     let (mut browser, mut handler) = Browser::launch(
@@ -98,9 +131,10 @@ async fn get_waf_cookies_with_playwright(account_name: &str) -> Result<HashMap<S
 
     let page = browser.new_page("about:blank").await?;
 
-    println!(
-        "[PROCESSING] {}: Step 1: Access login page to get initial cookies...",
-        account_name
+    log_account(
+        "ACCOUNT",
+        account_name,
+        "loading login page to obtain initial cookies",
     );
 
     page.goto("https://anyrouter.top/login").await?;
@@ -118,16 +152,19 @@ async fn get_waf_cookies_with_playwright(account_name: &str) -> Result<HashMap<S
         }
     }
 
-    println!(
-        "[INFO] {}: Got {} WAF cookies after step 1",
+    log_account(
+        "ACCOUNT",
         account_name,
-        waf_cookies.len()
+        format!(
+            "collected {} WAF cookies after loading login page",
+            waf_cookies.len()
+        ),
     );
 
     let required_cookies = ["acw_tc", "cdn_sec_tc", "acw_sc__v2"];
     let missing_cookies: Vec<_> = required_cookies
         .iter()
-        .filter(|c| !waf_cookies.contains_key(&c.to_string()))
+        .filter(|c| !waf_cookies.contains_key::<str>(*c))
         .collect();
 
     browser.close().await?;
@@ -135,16 +172,13 @@ async fn get_waf_cookies_with_playwright(account_name: &str) -> Result<HashMap<S
 
     if !missing_cookies.is_empty() {
         return Err(anyhow!(
-            "[FAILED] {}: Missing WAF cookies: {:?}",
+            "{}: Missing WAF cookies: {:?}",
             account_name,
             missing_cookies
         ));
     }
 
-    println!(
-        "[SUCCESS] {}: Successfully got all WAF cookies",
-        account_name
-    );
+    log_account("SUCCESS", account_name, "successfully resolved WAF cookies");
 
     Ok(waf_cookies)
 }
@@ -184,7 +218,7 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
                             quota: (quota * 100.0).round() / 100.0,
                             used_quota: (used_quota * 100.0).round() / 100.0,
                             display: format!(
-                                "[money]: Current balance: ${:.2}, Used: ${:.2}",
+                                "current balance ${:.2}, used ${:.2}",
                                 quota, used_quota
                             ),
                             error: None,
@@ -198,7 +232,7 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
                 quota: 0.0,
                 used_quota: 0.0,
                 display: String::new(),
-                error: Some(format!("Failed to get user info: HTTP {}", status)),
+                error: Some(format!("user profile request failed: HTTP {}", status)),
             }
         }
         Err(e) => UserInfo {
@@ -206,7 +240,7 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
             quota: 0.0,
             used_quota: 0.0,
             display: String::new(),
-            error: Some(format!("Failed to get user info: {}", e)),
+            error: Some(format!("user profile request failed: {}", e)),
         },
     }
 }
@@ -216,26 +250,35 @@ async fn check_in_account(
     account_index: usize,
 ) -> (bool, Option<UserInfo>) {
     let account_name = get_account_display_name(account_info, account_index);
-    println!("\n[PROCESSING] Starting to process {}", account_name);
+    println!();
+    log_account("ACCOUNT", &account_name, "starting check-in");
 
     let api_user = &account_info.api_user;
 
-    if api_user.is_empty() {
-        println!("[FAILED] {}: API user identifier not found", account_name);
+    if api_user.trim().is_empty() {
+        log_account(
+            "ERROR",
+            &account_name,
+            "configuration error: API user identifier is missing or empty",
+        );
         return (false, None);
     }
 
     let mut user_cookies = HashMap::new();
     user_cookies.insert("session".to_owned(), account_info.cookies.session.clone());
-    if user_cookies.is_empty() {
-        println!("[FAILED] {}: Invalid configuration format", account_name);
+    if account_info.cookies.session.trim().is_empty() {
+        log_account(
+            "ERROR",
+            &account_name,
+            "configuration error: session cookie is missing or empty",
+        );
         return (false, None);
     }
 
     let waf_cookies = match get_waf_cookies_with_playwright(&account_name).await {
         Ok(cookies) => cookies,
         Err(e) => {
-            println!("[FAILED] {}: {}", account_name, e);
+            log_account("ERROR", &account_name, e.to_string());
             return (false, None);
         }
     };
@@ -249,7 +292,17 @@ async fn check_in_account(
         );
     }
 
-    let client = Client::builder().cookie_provider(jar).build().unwrap();
+    let client = match Client::builder().cookie_provider(jar).build() {
+        Ok(client) => client,
+        Err(e) => {
+            log_account(
+                "ERROR",
+                &account_name,
+                format!("failed to create HTTP client: {}", e),
+            );
+            return (false, None);
+        }
+    };
 
     let mut headers = header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36".parse().unwrap());
@@ -270,12 +323,16 @@ async fn check_in_account(
 
     let user_info = get_user_info(&client, &headers).await;
     if user_info.success {
-        println!("{}", user_info.display);
+        log_account("BALANCE", &account_name, &user_info.display);
     } else if let Some(ref error) = user_info.error {
-        println!("{}", error);
+        log_account("WARN", &account_name, error);
     }
 
-    println!("[NETWORK] {}: Executing check-in", account_name);
+    log_account(
+        "HTTP",
+        &account_name,
+        "sending POST /api/user/sign_in request",
+    );
 
     let mut checkin_headers = headers.clone();
     checkin_headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
@@ -289,10 +346,13 @@ async fn check_in_account(
         .await
     {
         Ok(response) => {
-            println!(
-                "[RESPONSE] {}: Response status code {}",
-                account_name,
-                response.status()
+            log_account(
+                "HTTP",
+                &account_name,
+                format!(
+                    "received response {} for POST /api/user/sign_in",
+                    response.status()
+                ),
             );
 
             if response.status().is_success() {
@@ -306,7 +366,11 @@ async fn check_in_account(
                                 .unwrap_or(false);
 
                         if is_success {
-                            println!("[SUCCESS] {}: Check-in successful!", account_name);
+                            log_account(
+                                "SUCCESS",
+                                &account_name,
+                                "check-in completed successfully",
+                            );
                             (true, Some(user_info))
                         } else {
                             let error_msg = result
@@ -314,31 +378,37 @@ async fn check_in_account(
                                 .or_else(|| result.get("message"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Unknown error");
-                            println!("[FAILED] {}: Check-in failed - {}", account_name, error_msg);
+                            log_account(
+                                "ERROR",
+                                &account_name,
+                                format!("check-in failed: {}", error_msg),
+                            );
                             (false, Some(user_info))
                         }
                     }
                     Err(_) => {
-                        println!(
-                            "[FAILED] {}: Check-in failed - Invalid response format",
-                            account_name
+                        log_account(
+                            "ERROR",
+                            &account_name,
+                            "check-in failed: invalid JSON response from server",
                         );
                         (false, Some(user_info))
                     }
                 }
             } else {
-                println!(
-                    "[FAILED] {}: Check-in failed - HTTP {}",
-                    account_name,
-                    response.status()
+                log_account(
+                    "ERROR",
+                    &account_name,
+                    format!("check-in failed: HTTP {}", response.status()),
                 );
                 (false, Some(user_info))
             }
         }
         Err(e) => {
-            println!(
-                "[FAILED] {}: Error occurred during check-in process - {}",
-                account_name, e
+            log_account(
+                "ERROR",
+                &account_name,
+                format!("check-in failed: network error {}", e),
             );
             (false, None)
         }
@@ -348,7 +418,6 @@ async fn check_in_account(
 async fn get_account_from_cloudflare() -> Result<Vec<AccountInfo>> {
     let client = reqwest::Client::new();
     let auth_header = sha256_hex(&env::var("AUTH_VALUE")?);
-    println!("auth_header is{:?}", auth_header);
     let resp = client
         .get("https://kv-tutorial.cazean.workers.dev/")
         .query(&[("key", "anyrouter-accounts")])
@@ -372,16 +441,23 @@ async fn get_account_from_cloudflare() -> Result<Vec<AccountInfo>> {
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
-    println!(
-        "[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)"
+    log_line(
+        "SYSTEM",
+        "AnyRouter.top multi-account auto check-in script started (using Playwright)",
     );
-    println!(
-        "[TIME] Execution time: {}",
-        Local::now().format("%Y-%m-%d %H:%M:%S")
+    log_line(
+        "TIME",
+        format!(
+            "Execution time: {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        ),
     );
 
     let accounts = get_account_from_cloudflare().await?;
-    println!("[INFO] Found {} account configurations", accounts.len());
+    log_line(
+        "INFO",
+        format!("Found {} account configurations", accounts.len()),
+    );
 
     let last_balance_hash = load_balance_hash();
 
@@ -407,7 +483,11 @@ async fn main() -> Result<()> {
             should_notify_this_account = true;
             need_notify = true;
             let account_name = get_account_display_name(account, i);
-            println!("[NOTIFY] {} failed, will send notification", account_name);
+            log_account(
+                "NOTIFY",
+                &account_name,
+                "check-in failed, will include in notification",
+            );
         }
 
         if let Some(ref info) = user_info {
@@ -424,16 +504,28 @@ async fn main() -> Result<()> {
 
         if should_notify_this_account {
             let account_name = get_account_display_name(account, i);
-            let status = if success { "[SUCCESS]" } else { "[FAIL]" };
-            let mut account_result = format!("{} {}", status, account_name);
+            let status = if success {
+                "CHECK-IN OK"
+            } else {
+                "CHECK-IN FAILED"
+            };
 
-            if let Some(ref info) = user_info {
+            let detail = if let Some(ref info) = user_info {
                 if info.success {
-                    account_result.push_str(&format!("\n{}", info.display));
+                    info.display.clone()
                 } else if let Some(ref error) = info.error {
-                    account_result.push_str(&format!("\n{}", error));
+                    error.clone()
+                } else {
+                    "no additional error details available".to_string()
                 }
-            }
+            } else {
+                "no user information available".to_string()
+            };
+
+            let account_result = format!(
+                "[RESULT] account {} - {} ({})",
+                account_name, status, detail
+            );
 
             notification_content.push(account_result);
         }
@@ -449,13 +541,19 @@ async fn main() -> Result<()> {
         if last_balance_hash.is_none() {
             balance_changed = true;
             need_notify = true;
-            println!("[NOTIFY] First run detected, will send notification with current balances");
+            log_line(
+                "NOTIFY",
+                "First run detected; will send notification with current balances",
+            );
         } else if last_balance_hash.as_ref() != Some(hash) {
             balance_changed = true;
             need_notify = true;
-            println!("[NOTIFY] Balance changes detected, will send notification");
+            log_line(
+                "NOTIFY",
+                "Detected balance changes since last run; will send notification",
+            );
         } else {
-            println!("[INFO] No balance changes detected");
+            log_line("INFO", "No balance changes detected since last run");
         }
     }
 
@@ -465,7 +563,7 @@ async fn main() -> Result<()> {
             if let Some(balance) = current_balances.get(&account_key) {
                 let account_name = get_account_display_name(account, i);
                 let account_result = format!(
-                    "[BALANCE] {}\n:money: Current balance: ${:.2}, Used: ${:.2}",
+                    "[BALANCE] account {} - current balance ${:.2}, used ${:.2}",
                     account_name, balance.quota, balance.used
                 );
 
@@ -485,25 +583,28 @@ async fn main() -> Result<()> {
 
     if need_notify && !notification_content.is_empty() {
         let mut summary = vec![
-            "[STATS] Check-in result statistics:".to_string(),
-            format!("[SUCCESS] Success: {}/{}", success_count, total_count),
+            "[STATS] Check-in result summary:".to_string(),
             format!(
-                "[FAIL] Failed: {}/{}",
+                "[STATS] Successful accounts: {}/{}",
+                success_count, total_count
+            ),
+            format!(
+                "[STATS] Failed accounts: {}/{}",
                 total_count - success_count,
                 total_count
             ),
         ];
 
         if success_count == total_count {
-            summary.push("[SUCCESS] All accounts check-in successful!".to_string());
+            summary.push("[STATS] Overall status: ALL SUCCESS".to_string());
         } else if success_count > 0 {
-            summary.push("[WARN] Some accounts check-in successful".to_string());
+            summary.push("[STATS] Overall status: PARTIAL SUCCESS".to_string());
         } else {
-            summary.push("[ERROR] All accounts check-in failed".to_string());
+            summary.push("[STATS] Overall status: ALL FAILED".to_string());
         }
 
         let time_info = format!(
-            "[TIME] Execution time: {}",
+            "Execution time: {}",
             Local::now().format("%Y-%m-%d %H:%M:%S")
         );
 
@@ -521,12 +622,16 @@ async fn main() -> Result<()> {
             .push_message("AnyRouter Check-in Alert", &notify_content)
             .await;
 
-        println!("[NOTIFY] Notification sent due to failures or balance changes");
+        log_line(
+            "NOTIFY",
+            "Notification sent due to failures or balance changes",
+        );
     } else {
-        println!(
-            "[INFO] All accounts successful and no balance changes detected, notification skipped"
+        log_line(
+            "INFO",
+            "All accounts successful and no balance changes detected, notification skipped",
         );
     }
 
-    process::exit(if success_count > 0 { 0 } else { 1 });
+    process::exit(if success_count == total_count { 0 } else { 1 });
 }
