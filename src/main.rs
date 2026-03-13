@@ -6,7 +6,7 @@ use chrono::Local;
 use colored::Colorize;
 use futures::StreamExt;
 use notify::NotificationKit;
-use reqwest::{cookie::Jar, header, Client};
+use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::process;
-use std::sync::Arc;
 
 fn format_tag(tag: &str) -> String {
     match tag {
@@ -126,8 +125,19 @@ async fn get_waf_cookies_with_playwright(account_name: &str) -> Result<HashMap<S
         "starting browser to obtain WAF cookies",
     );
 
+    // Use a unique user-data-dir to isolate each browser instance.
+    // Without this, chromiumoxide defaults to a FIXED /tmp/chromiumoxide-runner
+    // directory, causing cookie leakage between accounts.
+    let browser_data_dir = std::env::temp_dir().join(format!(
+        "anyrouter-waf-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
     let (mut browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
+            .user_data_dir(&browser_data_dir)
             .window_size(1920, 1080)
             .build()
             .map_err(|e| anyhow!("Failed to build browser config: {}", e))?,
@@ -176,6 +186,7 @@ async fn get_waf_cookies_with_playwright(account_name: &str) -> Result<HashMap<S
 
     browser.close().await?;
     handle.abort();
+    let _ = fs::remove_dir_all(&browser_data_dir);
 
     if !missing_cookies.is_empty() {
         return Err(anyhow!(
@@ -200,15 +211,10 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
     {
         Ok(response) => {
             let status = response.status();
-            // print headers for debugging
-            for (key, value) in response.headers() {
-                log_line(
-                    "HTTP",
-                    format!("user info response header: {}: {}", key, value.to_str().unwrap_or("<invalid UTF-8>")),
-                );
-            }
+            let body_text = response.text().await.unwrap_or_default();
+
             if status.is_success() {
-                if let Ok(data) = response.json::<Value>().await {
+                if let Ok(data) = serde_json::from_str::<Value>(&body_text) {
                     if data
                         .get("success")
                         .and_then(|v| v.as_bool())
@@ -242,6 +248,8 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
                 }
             }
 
+            log_line("HTTP", format!("user/self HTTP {} body: {}", status, body_text));
+
             UserInfo {
                 success: false,
                 quota: 0.0,
@@ -267,20 +275,23 @@ fn build_authenticated_client(
     session: &str,
     api_user: &str,
 ) -> Result<(Client, header::HeaderMap)> {
-    let jar = Arc::new(Jar::default());
-    let url = &"https://anyrouter.top".parse().unwrap();
-
-    for (key, value) in waf_cookies {
-        jar.add_cookie_str(&format!("{}={}", key, value), url);
-    }
-    jar.add_cookie_str(&format!("session={}", session), url);
-
     let client = Client::builder()
-        .cookie_provider(jar)
         .build()
         .map_err(|e| anyhow!("failed to create HTTP client: {}", e))?;
 
+    let mut all_cookies = waf_cookies.clone();
+    if !session.is_empty() {
+        all_cookies.insert("session".to_string(), session.to_string());
+    }
+
+    let cookie_header: String = all_cookies
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("; ");
+
     let mut headers = header::HeaderMap::new();
+    headers.insert(header::COOKIE, cookie_header.parse().unwrap());
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36".parse().unwrap());
     headers.insert(
         header::ACCEPT,
@@ -337,15 +348,24 @@ async fn login_via_github_browser(
     github_username: &str,
     github_password: &str,
     totp_secret: &str,
-) -> Result<(HashMap<String, String>, String)> {
+) -> Result<(HashMap<String, String>, String, String)> {
     log_account(
         "ACCOUNT",
         account_name,
         "starting browser for GitHub OAuth login",
     );
 
+    // Unique user-data-dir: see get_waf_cookies_with_playwright for rationale.
+    let browser_data_dir = std::env::temp_dir().join(format!(
+        "anyrouter-login-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
     let (mut browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
+            .user_data_dir(&browser_data_dir)
             .window_size(1920, 1080)
             .build()
             .map_err(|e| anyhow!("failed to build browser config: {}", e))?,
@@ -355,11 +375,8 @@ async fn login_via_github_browser(
     let handle = tokio::task::spawn(async move { while let Some(_) = handler.next().await {} });
     let page = browser.new_page("about:blank").await?;
 
-    log_account(
-        "ACCOUNT",
-        account_name,
-        "loading login page for WAF cookies",
-    );
+    // Step 1: Load login page to pass WAF and collect WAF cookies
+    log_account("ACCOUNT", account_name, "loading login page for WAF cookies");
     page.goto("https://anyrouter.top/login").await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
@@ -374,39 +391,70 @@ async fn login_via_github_browser(
     log_account(
         "ACCOUNT",
         account_name,
-        format!("collected {} WAF cookies, initiating GitHub OAuth", waf_cookies.len()),
+        format!("collected {} WAF cookies", waf_cookies.len()),
     );
 
-    let github_clicked: bool = page
+    // Step 2: Get github_client_id from /api/status
+    let status_result: String = page
         .evaluate(
-            r#"(function() {
-                var els = document.querySelectorAll('a, button');
-                for (var i = 0; i < els.length; i++) {
-                    var el = els[i];
-                    var href = el.href || '';
-                    var text = (el.textContent || '').toLowerCase();
-                    if (href.indexOf('oauth/github') !== -1 || href.indexOf('github.com') !== -1 ||
-                        (text.indexOf('github') !== -1 && (el.tagName === 'BUTTON' || el.tagName === 'A'))) {
-                        el.click();
-                        return true;
-                    }
-                }
-                return false;
+            r#"(async function() {
+                try {
+                    var resp = await fetch('/api/status');
+                    var data = await resp.json();
+                    return data.data.github_client_id || '';
+                } catch(e) { return 'ERROR:' + e.message; }
             })()"#,
         )
         .await?
         .into_value()?;
 
-    if !github_clicked {
-        log_account(
-            "WARN",
-            account_name,
-            "GitHub login button not found on page, trying direct OAuth endpoint",
-        );
-        page.goto("https://anyrouter.top/api/oauth/github")
-            .await?;
+    if status_result.is_empty() || status_result.starts_with("ERROR:") {
+        browser.close().await?;
+        handle.abort();
+        return Err(anyhow!(
+            "failed to get github_client_id from /api/status: {}",
+            status_result
+        ));
     }
+    let github_client_id = status_result;
+    log_account(
+        "ACCOUNT",
+        account_name,
+        format!("got github_client_id: {}", &github_client_id),
+    );
 
+    // Step 3: Call /api/oauth/state to generate CSRF state (sets session cookie)
+    let state: String = page
+        .evaluate(
+            r#"(async function() {
+                try {
+                    var resp = await fetch('/api/oauth/state');
+                    var data = await resp.json();
+                    if (data.success) return data.data;
+                    return 'ERROR:' + (data.message || 'unknown');
+                } catch(e) { return 'ERROR:' + e.message; }
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+
+    if state.starts_with("ERROR:") {
+        browser.close().await?;
+        handle.abort();
+        return Err(anyhow!("failed to get OAuth state: {}", state));
+    }
+    log_account(
+        "ACCOUNT",
+        account_name,
+        format!("got OAuth state: {}", &state),
+    );
+
+    // Step 4: Navigate to GitHub OAuth authorization
+    let github_oauth_url = format!(
+        "https://github.com/login/oauth/authorize?client_id={}&state={}&scope=user:email",
+        github_client_id, state
+    );
+    page.goto(&github_oauth_url).await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let current_url: String = page
@@ -414,7 +462,8 @@ async fn login_via_github_browser(
         .await?
         .into_value()?;
 
-    if current_url.contains("github.com") {
+    // Step 5: Handle GitHub login
+    if current_url.contains("github.com/login") {
         log_account(
             "ACCOUNT",
             account_name,
@@ -447,6 +496,7 @@ async fn login_via_github_browser(
             .await?
             .into_value()?;
 
+        // Step 6: Handle TOTP 2FA
         if current_url.contains("/sessions/two-factor") || current_url.contains("/2fa") {
             log_account(
                 "ACCOUNT",
@@ -456,16 +506,73 @@ async fn login_via_github_browser(
 
             let code = generate_totp(totp_secret)?;
 
-            page.find_element("#app_totp")
+            // GitHub's 2FA page defaults to passkey/WebAuthn — click through to TOTP input
+            let switched_to_totp: bool = page
+                .evaluate(
+                    r#"(function() {
+                        var links = document.querySelectorAll('a, button');
+                        for (var i = 0; i < links.length; i++) {
+                            var text = (links[i].textContent || '').toLowerCase();
+                            if (text.indexOf('authenticator') !== -1 || text.indexOf('totp') !== -1 ||
+                                text.indexOf('another way') !== -1 || text.indexOf('other method') !== -1 ||
+                                text.indexOf('verification code') !== -1 || text.indexOf('use your') !== -1 ||
+                                text.indexOf('authentication app') !== -1 || text.indexOf('另一种方式') !== -1) {
+                                links[i].click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()"#,
+                )
                 .await?
-                .click()
+                .into_value()?;
+
+            if switched_to_totp {
+                log_account(
+                    "ACCOUNT",
+                    account_name,
+                    "switched from passkey to TOTP input",
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            }
+
+            let totp_filled: bool = page
+                .evaluate(format!(
+                    r#"(function() {{
+                        var selectors = ['#app_totp', '#totp', 'input[name="app_totp"]', 'input[name="totp"]',
+                                         'input[autocomplete="one-time-code"]',
+                                         'input[type="text"][inputmode="numeric"]',
+                                         'input[type="number"]', 'input[inputmode="numeric"]',
+                                         'input[type="text"]:not([name="authenticity_token"]):not([type="hidden"])'];
+                        for (var i = 0; i < selectors.length; i++) {{
+                            var el = document.querySelector(selectors[i]);
+                            if (el) {{
+                                el.focus();
+                                el.value = '{}';
+                                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    }})()"#,
+                    code
+                ))
                 .await?
-                .type_str(&code)
-                .await?;
+                .into_value()?;
+
+            if !totp_filled {
+                browser.close().await?;
+                handle.abort();
+                return Err(anyhow!(
+                    "could not find TOTP input field on GitHub 2FA page"
+                ));
+            }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
 
+        // Step 7: Handle OAuth authorization prompt (first-time auth)
         let current_url: String = page
             .evaluate("window.location.href")
             .await?
@@ -483,14 +590,32 @@ async fn login_via_github_browser(
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
+    } else if current_url.contains("/oauth/authorize") {
+        // Already logged in but needs authorization
+        log_account(
+            "ACCOUNT",
+            account_name,
+            "authorizing OAuth app on GitHub (already logged in)",
+        );
+        if let Ok(btn) = page.find_element("#js-oauth-authorize-btn").await {
+            btn.click().await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
     }
 
+    // Step 8: Wait for redirect back to anyrouter.top
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     let final_url: String = page
         .evaluate("window.location.href")
         .await?
         .into_value()?;
+
+    log_account(
+        "ACCOUNT",
+        account_name,
+        format!("after GitHub auth, landed at: {}", &final_url),
+    );
 
     if !final_url.contains("anyrouter.top") {
         browser.close().await?;
@@ -501,12 +626,43 @@ async fn login_via_github_browser(
         ));
     }
 
+    // The React SPA handles the OAuth callback automatically:
+    // /oauth/github?code=...&state=... → AJAX to /api/oauth/github → navigate to /console/token
+    // By now the session cookie is already set and the user is logged in.
+
+    // Extract user info from localStorage (set by the React app after successful login)
+    let user_id: String = page
+        .evaluate(
+            r#"(function() {
+                try {
+                    var user = JSON.parse(localStorage.getItem('user') || '{}');
+                    return (user.id || '').toString();
+                } catch(e) { return ''; }
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+
+    if user_id.is_empty() {
+        browser.close().await?;
+        handle.abort();
+        return Err(anyhow!(
+            "OAuth login seemed to complete but no user data found in localStorage"
+        ));
+    }
+
+    log_account(
+        "ACCOUNT",
+        account_name,
+        format!("OAuth login returned user_id: {}", &user_id),
+    );
+
     let final_cookies = page.get_cookies().await?;
     let session = final_cookies
         .iter()
         .find(|c| c.name == "session")
         .map(|c| c.value.clone())
-        .ok_or_else(|| anyhow!("session cookie not found after GitHub OAuth login"))?;
+        .ok_or_else(|| anyhow!("session cookie not found after OAuth login"))?;
 
     for cookie in &final_cookies {
         if ["acw_tc", "cdn_sec_tc", "acw_sc__v2"].contains(&cookie.name.as_str()) {
@@ -516,26 +672,34 @@ async fn login_via_github_browser(
 
     browser.close().await?;
     handle.abort();
+    let _ = fs::remove_dir_all(&browser_data_dir);
 
     log_account(
         "SUCCESS",
         account_name,
-        "GitHub OAuth login successful, session obtained",
+        format!(
+            "GitHub OAuth login successful, session obtained (len={})",
+            session.len()
+        ),
     );
 
-    Ok((waf_cookies, session))
+    Ok((waf_cookies, session, user_id))
 }
 
 async fn update_accounts_in_cloudflare(accounts: &[AccountInfo]) -> Result<()> {
     let client = reqwest::Client::new();
     let auth_header = sha256_hex(&env::var("AUTH_VALUE")?);
 
+    let accounts_json = serde_json::to_string(accounts)?;
+
     let resp = client
         .put("https://kv-tutorial.cazean.workers.dev/")
-        .query(&[("key", "anyrouter-accounts")])
         .header("x-auth", auth_header)
         .header(header::CONTENT_TYPE, "application/json")
-        .json(accounts)
+        .json(&json!({
+            "key": "anyrouter-accounts",
+            "value": accounts_json
+        }))
         .send()
         .await?;
 
@@ -623,19 +787,22 @@ async fn check_in_account(
                 "session expired (HTTP 401), attempting GitHub OAuth login",
             );
             match login_via_github_browser(&account_name, github_username, github_password, totp_secret).await {
-                Ok((new_waf_cookies, new_session)) => {
+                Ok((new_waf_cookies, new_session, new_user_id)) => {
                     log_account(
                         "SUCCESS",
                         &account_name,
                         "GitHub OAuth login successful, session renewed",
                     );
                     account_info.cookies.session = new_session;
+                    if !new_user_id.is_empty() {
+                        account_info.api_user = new_user_id;
+                    }
                     session_updated = true;
 
                     match build_authenticated_client(
                         &new_waf_cookies,
                         &account_info.cookies.session,
-                        &api_user,
+                        &account_info.api_user,
                     ) {
                         Ok((new_client, new_headers)) => {
                             client = new_client;
@@ -827,7 +994,7 @@ async fn main() -> Result<()> {
         ),
     );
 
-    let mut accounts = get_account_from_cloudflare().await?;
+    let mut accounts: Vec<AccountInfo> = get_account_from_cloudflare().await?;
     log_line(
         "INFO",
         format!("Found {} account configurations", accounts.len()),

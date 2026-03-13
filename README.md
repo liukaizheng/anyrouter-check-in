@@ -1,226 +1,378 @@
-# Any Router 多账号自动签到
+# AnyRouter Auto Check-in
 
-推荐搭配使用[Auo](https://github.com/millylee/auo)，支持任意 Claude Code Token 切换的工具。
+Automated daily check-in for [AnyRouter.top](https://anyrouter.top/register?aff=gSsN) — a Claude Code proxy that gives $25 per daily check-in. Supports multi-account, automatic session renewal via GitHub OAuth, WAF bypass, and 6 notification channels.
 
-**维护开源不易，如果本项目帮助到了你，请帮忙点个 Star，谢谢!**
+Pair with [Auo](https://github.com/millylee/auo) for seamless Claude Code token switching.
 
-用于 Claude Code 中转站 Any Router 多账号每日签到，一次 $25，限时注册即送 100 美金，[点击这里注册](https://anyrouter.top/register?aff=gSsN)。业界良心，支持 Claude Code 百万上下文（使用 `/model sonnet[1m]` 开启），`gemini-2.5-pro` 模型。
+## Features
 
-## 功能特性
+- Multi-account daily check-in ($25/day per account)
+- Automatic session renewal via GitHub OAuth (no manual cookie refresh)
+- WAF bypass via headless Chromium
+- Session persistence to Cloudflare KV
+- Balance change detection with smart notifications
+- 6 notification channels: Email, DingTalk, Feishu, WeCom, PushPlus, ServerChan
 
-- ✅ 单个/多账号自动签到
-- ✅ 多种机器人通知（可选）
-- ✅ 绕过 WAF 限制
+---
 
-## 使用方法
+## How It Works
 
-### 1. Fork 本仓库
+### High-Level Check-in Flow
 
-点击右上角的 "Fork" 按钮，将本仓库 fork 到你的账户。
+```
+                    +-----------------------+
+                    |  Load account configs |
+                    |  (env var or CF KV)   |
+                    +-----------+-----------+
+                                |
+                    +-----------v-----------+
+                    |  For each account:    |
+                    +-----------+-----------+
+                                |
+                    +-----------v-----------+
+                    |  Launch headless      |
+                    |  Chromium, load       |
+                    |  anyrouter.top/login  |
+                    |  to obtain WAF cookies|
+                    |  (acw_tc, cdn_sec_tc, |
+                    |   acw_sc__v2)         |
+                    +-----------+-----------+
+                                |
+                    +-----------v-----------+
+                    |  Build HTTP client    |
+                    |  with WAF cookies +   |
+                    |  session cookie +     |
+                    |  New-Api-User header  |
+                    +-----------+-----------+
+                                |
+                    +-----------v-----------+
+                    |  GET /api/user/self   |
+                    |  (verify session)     |
+                    +-----------+-----------+
+                               / \
+                    +---------+   +---------+
+                    | 200 OK  |   | 401     |
+                    +----+----+   +----+----+
+                         |             |
+                         |    +--------v--------+
+                         |    | Has GitHub creds?|
+                         |    +-------+---------+
+                         |           / \
+                         |    +-----+   +------+
+                         |    | Yes |   | No   |
+                         |    +--+--+   +--+---+
+                         |       |         |
+                         |  +----v----+    | FAIL
+                         |  | GitHub  |    |
+                         |  | OAuth   |<---+
+                         |  | Login   |
+                         |  | (below) |
+                         |  +----+----+
+                         |       |
+                         |  +----v-----------+
+                         |  | Rebuild client |
+                         |  | with new       |
+                         |  | session + WAF  |
+                         |  +----+-----------+
+                         |       |
+                    +----v-------v----+
+                    |  POST           |
+                    |  /api/user/     |
+                    |  sign_in        |
+                    +---------+-------+
+                              |
+                    +---------v---------+
+                    |  GET /api/user/   |
+                    |  self (post       |
+                    |  check-in balance)|
+                    +---------+---------+
+                              |
+                    +---------v---------+
+                    |  If session was   |
+                    |  renewed, persist |
+                    |  to Cloudflare KV |
+                    +---------+---------+
+                              |
+                    +---------v---------+
+                    |  Compare balance  |
+                    |  hash, send       |
+                    |  notifications    |
+                    |  if changed/failed|
+                    +-------------------+
+```
 
-### 2. 获取账号信息
+### GitHub OAuth Session Acquisition (Detailed)
 
-对于每个需要签到的账号，你需要获取：
-1. **Cookies**: 用于身份验证
-2. **API User**: 用于请求头的 new-api-user 参数
+This is the core of automatic session renewal. When a session expires (HTTP 401), the program launches a full browser-based GitHub OAuth flow to obtain a fresh session cookie. This is necessary because anyrouter.top **only supports GitHub OAuth login** — there is no email/password option.
 
-#### 获取 Cookies：
-1. 打开浏览器，访问 https://anyrouter.top/
-2. 登录你的账户
-3. 打开开发者工具 (F12)
-4. 切换到 "Application" 或 "存储" 选项卡
-5. 找到 "Cookies" 选项
-6. 复制所有 cookies
+AnyRouter is built on [new-api](https://github.com/songquanpeng/one-api) (a fork of one-api). The OAuth flow is a **multi-party protocol** between the headless browser, the React SPA frontend, the new-api Go backend, and GitHub:
 
-#### 获取 API User：
-通常在网站的用户设置或 API 设置中可以找到，每个账号都有唯一的标识。
+```
+  Headless Browser              AnyRouter Frontend           AnyRouter Backend             GitHub
+  (chromiumoxide)               (React SPA)                  (new-api / Go)               (OAuth Provider)
+       |                              |                            |                           |
+       |  1. GET /login               |                            |                           |
+       |----------------------------->|                            |                           |
+       |  (page loads, WAF cookies    |                            |                           |
+       |   acw_tc/cdn_sec_tc/         |                            |                           |
+       |   acw_sc__v2 are set by CDN) |                            |                           |
+       |                              |                            |                           |
+       |  2. fetch('/api/status')     |                            |                           |
+       |----------------------------->|--------------------------->|                           |
+       |  <-- { github_client_id }    |<--------------------------|                           |
+       |                              |                            |                           |
+       |  3. fetch('/api/oauth/state')|                            |                           |
+       |----------------------------->|--------------------------->|                           |
+       |                              |  Backend generates CSRF    |                           |
+       |                              |  state, stores in gorilla/ |                           |
+       |                              |  sessions server-side,     |                           |
+       |  <-- { state: "abc123" }     |  sets initial `session`    |                           |
+       |      + session cookie set    |  cookie on response        |                           |
+       |                              |                            |                           |
+       |  4. Navigate to GitHub OAuth URL                          |                           |
+       |  GET /login/oauth/authorize?client_id={id}&state={state}&scope=user:email             |
+       |----------------------------------------------------------------------------------------->|
+       |                              |                            |                           |
+       |  5. GitHub login page loads  |                            |                           |
+       |  Fill #login_field (username)|                            |                           |
+       |  Fill #password              |                            |                           |
+       |  Click input[name='commit']  |                            |                           |
+       |----------------------------------------------------------------------------------------->|
+       |                              |                            |                           |
+       |  6. GitHub 2FA page          |                            |                           |
+       |  (defaults to passkey/WebAuthn prompt)                    |                           |
+       |  Click "Use authenticator app" link                       |                           |
+       |  to switch to TOTP input     |                            |                           |
+       |                              |                            |                           |
+       |  7. Generate TOTP code       |                            |                           |
+       |  (RFC 6238 HMAC-SHA1,        |                            |                           |
+       |   30-second time step)       |                            |                           |
+       |  Fill TOTP input field       |                            |                           |
+       |----------------------------------------------------------------------------------------->|
+       |                              |                            |                           |
+       |  8. (First-time only) GitHub shows OAuth authorization prompt                         |
+       |  Click #js-oauth-authorize-btn to grant access            |                           |
+       |----------------------------------------------------------------------------------------->|
+       |                              |                            |                           |
+       |  9. GitHub redirects to:     |                            |                           |
+       |  anyrouter.top/oauth/github?code={code}&state={state}     |                           |
+       |  (This is a FRONTEND route,  |                            |                           |
+       |   NOT an API endpoint)       |                            |                           |
+       |----------------------------->|                            |                           |
+       |                              |                            |                           |
+       |  10. React OAuth2Callback    |                            |                           |
+       |  component mounts, extracts  |                            |                           |
+       |  code & state from URL,      |                            |                           |
+       |  makes AJAX call:            |                            |                           |
+       |                              |  GET /api/oauth/github     |                           |
+       |                              |  ?code={code}&state={state}|                           |
+       |                              |--------------------------->|                           |
+       |                              |                            |  Exchange code for token  |
+       |                              |                            |-------------------------->|
+       |                              |                            |  <-- access_token         |
+       |                              |                            |                           |
+       |                              |                            |  GET /user (GitHub API)   |
+       |                              |                            |-------------------------->|
+       |                              |                            |  <-- user profile + email |
+       |                              |                            |                           |
+       |                              |  Backend validates state   |                           |
+       |                              |  against session, looks up |                           |
+       |                              |  or creates user, calls    |                           |
+       |                              |  setupLogin() which stores |                           |
+       |                              |  {id, username, role,      |                           |
+       |                              |   status, group} in the    |                           |
+       |                              |  gorilla/sessions session  |                           |
+       |                              |                            |                           |
+       |                              |  <-- JSON {success, data:  |                           |
+       |                              |       {username, role...}} |                           |
+       |                              |  + updated session cookie  |                           |
+       |                              |                            |                           |
+       |  11. React stores user data  |                            |                           |
+       |  in localStorage, navigates  |                            |                           |
+       |  to /console/token           |                            |                           |
+       |                              |                            |                           |
+       |  Browser extracts:           |                            |                           |
+       |  - session cookie (from      |                            |                           |
+       |    browser cookie jar)       |                            |                           |
+       |  - user_id (from             |                            |                           |
+       |    localStorage.user.id)     |                            |                           |
+       |  - WAF cookies (refreshed)   |                            |                           |
+       |                              |                            |                           |
+       v                              v                            v                           v
+```
 
-### 3. 设置 GitHub Environment Secret
+#### Key Technical Details
 
-1. 在你 fork 的仓库中，点击 "Settings" 选项卡
-2. 在左侧菜单中找到 "Environments" -> "New environment"
-3. 新建一个名为 `production` 的环境
-4. 点击新建的 `production` 环境进入环境配置页
-5. 点击 "Add environment secret" 创建 secret：
-   - Name: `ANYROUTER_ACCOUNTS`
-   - Value: 你的多账号配置数据
+**Why browser automation?** AnyRouter's OAuth flow involves a React SPA that handles the callback client-side. The redirect from GitHub goes to a frontend route (`/oauth/github`), not an API endpoint. The React `OAuth2Callback` component extracts the `code` and `state` from the URL and makes the actual API call. This cannot be replicated with simple HTTP requests.
 
-### 4. 多账号配置格式
+**WAF cookies**: AnyRouter uses CDN-level WAF protection that sets 3 required cookies (`acw_tc`, `cdn_sec_tc`, `acw_sc__v2`) via JavaScript challenge. These must be present on every API request or you get blocked.
 
-支持单个与多个账号配置，可选 `name` 字段用于自定义账号显示名称：
+**Session cookie format**: Go gorilla/sessions base64-encoded cookie (~440 chars, contains `|` characters). The standard `reqwest::cookie::Jar` doesn't reliably transmit these, so the program builds the `Cookie` header manually.
+
+**Auth middleware requirements** (from new-api's `middleware/auth.go`):
+1. Session must have `username` set (otherwise: 401 "未登录且未提供 access token")
+2. `New-Api-User` header must be present and match the session's user ID
+3. Both checks happen in sequence — session first, then header match
+
+**GitHub 2FA handling**: GitHub now defaults to a passkey/WebAuthn prompt on the 2FA page. The program clicks the "Use authenticator app" link to switch to the TOTP input before entering the generated code.
+
+**TOTP generation**: RFC 6238 compliant — HMAC-SHA1 with 30-second time step over the base32-decoded secret.
+
+---
+
+## Setup
+
+### Option A: Manual Session (Simple)
+
+Use this if you don't want auto-renewal. You'll need to manually refresh the session cookie when it expires (~1 month).
+
+1. Log in to [anyrouter.top](https://anyrouter.top) via GitHub
+2. Open DevTools (F12) → Application → Cookies → copy `session` value
+
+   ![Get session](./assets/request-session.png)
+
+3. Open DevTools → Network → filter Fetch/XHR → find the `New-Api-User` header value (5-digit number)
+
+   ![Get api_user](./assets/request-api-user.png)
+
+4. Configure your accounts (see [Account Configuration](#account-configuration))
+
+### Option B: Auto-Renewal (Recommended)
+
+The session auto-renews via GitHub OAuth when it expires. Requires:
+
+- GitHub account credentials (username + password)
+- TOTP secret (base32) for your GitHub 2FA authenticator app
+- Cloudflare KV worker for session persistence (so renewed sessions survive across runs)
+
+To get your TOTP secret: when setting up 2FA on GitHub, the setup page shows a QR code. The base32 secret is usually displayed as text below the QR code (e.g., `M5JK HZ2I KGON 2VOK`). Save this value.
+
+---
+
+## Account Configuration
+
+### Format
 
 ```json
 [
   {
-    "name": "我的主账号",
-    "cookies": {
-      "session": "account1_session_value"
-    },
-    "api_user": "account1_api_user_id"
-  },
-  {
-    "name": "备用账号",
-    "cookies": {
-      "session": "account2_session_value"
-    },
-    "api_user": "account2_api_user_id"
+    "name": "main account",
+    "cookies": { "session": "your_session_value" },
+    "api_user": "88888",
+    "github_username": "your_github_username",
+    "github_password": "your_github_password",
+    "totp_secret": "YOUR_TOTP_SECRET_BASE32"
   }
 ]
 ```
 
-**字段说明**：
-- `cookies` (必需)：用于身份验证的 cookies 数据
-- `api_user` (必需)：用于请求头的 new-api-user 参数
-- `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | No | Display name for logs and notifications. Defaults to `Account 1`, `Account 2`, etc. |
+| `cookies.session` | Yes | Session cookie value. Can be empty string `""` if GitHub credentials are provided (will auto-login on first run). |
+| `api_user` | Yes | The `New-Api-User` header value (5-digit user ID). Updated automatically after OAuth login. |
+| `github_username` | No | GitHub username for auto-renewal. |
+| `github_password` | No | GitHub password for auto-renewal. |
+| `totp_secret` | No | Base32 TOTP secret for GitHub 2FA. Required if GitHub account has 2FA enabled. |
 
-如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称。
-
-接下来获取 cookies 与 api_user 的值。
-
-通过 F12 工具，切到 Application 面板，拿到 session 的值，最好重新登录下，该值 1 个月有效期，但有可能提前失效，失效后报 401 错误，到时请再重新获取。
-
-![获取 cookies](./assets/request-session.png)
-
-通过 F12 工具，切到 Network 面板，可以过滤下，只要 Fetch/XHR，找到带 `New-Api-User`，这个值正常是 5 位数，如果是负数或者个位数，正常是未登录。
-
-![获取 api_user](./assets/request-api-user.png)
-
-### 5. 启用 GitHub Actions
-
-1. 在你的仓库中，点击 "Actions" 选项卡
-2. 如果提示启用 Actions，请点击启用
-3. 找到 "AnyRouter 自动签到" workflow
-4. 点击 "Enable workflow"
-
-### 6. 测试运行
-
-你可以手动触发一次签到来测试：
-
-1. 在 "Actions" 选项卡中，点击 "AnyRouter 自动签到"
-2. 点击 "Run workflow" 按钮
-3. 确认运行
-
-![运行结果](./assets/check-in.png)
-
-## 执行时间
-
-- 脚本每6小时执行一次（1. action 无法准确触发，基本延时 1~1.5h；2. 目前观测到 anyrouter 的签到是每 24h 而不是零点就可签到）
-- 你也可以随时手动触发签到
-
-## 注意事项
-
-- 请确保每个账号的 cookies 和 API User 都是正确的
-- 可以在 Actions 页面查看详细的运行日志
-- 支持部分账号失败，只要有账号成功签到，整个任务就不会失败
-- 报 401 错误，请重新获取 cookies，理论 1 个月失效，但有 Bug，详见 [#6](https://github.com/millylee/anyrouter-check-in/issues/6)
-- 请求 200，但出现 Error 1040（08004）：Too many connections，官方数据库问题，目前已修复，但遇到几次了，详见 [#7](https://github.com/millylee/anyrouter-check-in/issues/7)
-
-## 配置示例
-
-假设你有两个账号需要签到：
-
+**Minimum config** (manual session only):
 ```json
-[
-  {
-    "cookies": {
-      "session": "abc123session"
-    },
-    "api_user": "user123"
-  },
-  {
-    "cookies": {
-      "session": "xyz789session"
-    },
-    "api_user": "user456"
-  }
-]
+[{ "cookies": { "session": "abc123" }, "api_user": "12345" }]
 ```
 
-## 开启通知
-
-脚本支持多种通知方式，可以通过配置以下环境变量开启，如果 `webhook` 有要求安全设置，例如钉钉，可以在新建机器人时选择自定义关键词，填写 `AnyRouter`。
-
-### 邮箱通知
-- `EMAIL_USER`: 发件人邮箱地址
-- `EMAIL_PASS`: 发件人邮箱密码/授权码
-- `CUSTOM_SMTP_SERVER`: 自定义发件人SMTP服务器(可选)
-- `EMAIL_TO`: 收件人邮箱地址
-### 钉钉机器人
-- `DINGDING_WEBHOOK`: 钉钉机器人的 Webhook 地址
-
-### 飞书机器人
-- `FEISHU_WEBHOOK`: 飞书机器人的 Webhook 地址
-
-### 企业微信机器人
-- `WEIXIN_WEBHOOK`: 企业微信机器人的 Webhook 地址
-
-### PushPlus 推送
-- `PUSHPLUS_TOKEN`: PushPlus 的 Token
-
-### Server酱
-- `SERVERPUSHKEY`: Server酱的 SendKey
-
-配置步骤：
-1. 在仓库的 Settings -> Environments -> production -> Environment secrets 中添加上述环境变量
-2. 每个通知方式都是独立的，可以只配置你需要的推送方式
-3. 如果某个通知方式配置不正确或未配置，脚本会自动跳过该通知方式
-
-## 故障排除
-
-如果签到失败，请检查：
-
-1. 账号配置格式是否正确
-2. cookies 是否过期
-3. API User 是否正确
-4. 网站是否更改了签到接口
-5. 查看 Actions 运行日志获取详细错误信息
-
-## 本地开发环境设置
-
-如果你需要在本地测试或开发，请按照以下步骤设置：
-
-### Python 版本
-```bash
-# 安装所有依赖
-uv sync --dev
-
-# 安装 Playwright 浏览器
-playwright install chromium
-
-# 按 .env.example 创建 .env
-uv run checkin.py
+**Full config** (with auto-renewal):
+```json
+[{ "name": "main", "cookies": { "session": "" }, "api_user": "12345", "github_username": "user", "github_password": "pass", "totp_secret": "SECRET" }]
 ```
 
-### Rust 版本
+---
+
+## Deployment
+
+### GitHub Actions (Recommended)
+
+1. **Fork** this repository
+2. Go to **Settings** → **Environments** → **New environment** → name it `production`
+3. Add environment secrets:
+
+   | Secret | Required | Description |
+   |--------|----------|-------------|
+   | `ANYROUTER_ACCOUNTS` | Yes* | JSON array of account configs (see above) |
+   | `AUTH_VALUE` | Yes* | Cloudflare KV auth value (for auto-renewal persistence) |
+
+   \* If using Cloudflare KV, `ANYROUTER_ACCOUNTS` is read from KV instead. Set `AUTH_VALUE` to enable KV access.
+
+4. Go to **Actions** → **AnyRouter 自动签到** → **Enable workflow**
+5. Click **Run workflow** to test
+
+The workflow runs every 6 hours via cron. GitHub Actions cron has ~1-1.5h delay; anyrouter.top check-in resets every 24h (not at midnight).
+
+![Check-in result](./assets/check-in.png)
+
+### Local Development
+
 ```bash
-# 安装依赖并构建
+# Clone and build
+git clone https://github.com/your-fork/anyrouter-check-in.git
+cd anyrouter-check-in
 cargo build --release
 
-# 按 .env.example 创建 .env
-# 程序会自动下载并启动 Chrome 浏览器（无需手动安装 ChromeDriver）
+# Create .env from template
+cp .env.example .env
+# Edit .env with your account config
+
+# Run
 cargo run --release
 ```
 
-**注意**：Rust 版本使用 `chromiumoxide`，会自动管理 Chrome 浏览器，无需手动安装 ChromeDriver。
+The program auto-downloads and manages a headless Chromium browser via `chromiumoxide` — no manual ChromeDriver installation needed.
 
-## 测试
+### Cloudflare KV Storage
 
-### Python 版本
-```bash
-uv sync --dev
+When `AUTH_VALUE` is set and `ANYROUTER_ACCOUNTS` env var is absent, the program reads account configs from Cloudflare KV. After a session is renewed via OAuth, the updated session is written back to KV so subsequent runs use the fresh session.
 
-# 安装 Playwright 浏览器
-playwright install chromium
+KV API:
+- **Read**: `GET /?key=anyrouter-accounts` with `x-auth: sha256(AUTH_VALUE)` header
+- **Write**: `PUT /` with body `{"key": "anyrouter-accounts", "value": "<json-string>"}` and `x-auth` header
 
-# 运行测试
-uv run pytest tests/
-```
+---
 
-### Rust 版本
-```bash
-cargo test
-```
+## Notifications
 
-## 免责声明
+Notifications are sent when check-in fails or account balance changes. Configure via environment secrets:
 
-本脚本仅用于学习和研究目的，使用前请确保遵守相关网站的使用条款.
+| Channel | Environment Variables |
+|---------|----------------------|
+| Email | `EMAIL_USER`, `EMAIL_PASS`, `EMAIL_TO`, `CUSTOM_SMTP_SERVER` (optional) |
+| DingTalk | `DINGDING_WEBHOOK` |
+| Feishu | `FEISHU_WEBHOOK` |
+| WeCom | `WEIXIN_WEBHOOK` |
+| PushPlus | `PUSHPLUS_TOKEN` |
+| ServerChan | `SERVERPUSHKEY` |
+
+For webhook-based channels with keyword security (e.g., DingTalk), set the custom keyword to `AnyRouter`.
+
+Each channel is independent — unconfigured channels are silently skipped.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| HTTP 401 | Session expired | Add GitHub credentials for auto-renewal, or manually refresh session cookie |
+| Missing WAF cookies | CDN challenge failed | The program retries automatically; check if anyrouter.top is accessible |
+| TOTP input not found | GitHub changed 2FA page layout | Open an issue — the selector list may need updating |
+| Error 1040 (08004) | AnyRouter's database overloaded | Transient server-side issue; retry later ([#7](https://github.com/millylee/anyrouter-check-in/issues/7)) |
+| OAuth redirect fails | GitHub OAuth app config changed | Verify `github_client_id` returned by `/api/status` |
+| All accounts log in as the same user | Browser profile shared across launches | Fixed — each browser now uses an isolated temp directory (see below) |
+
+### Browser Profile Isolation (chromiumoxide quirk)
+
+`chromiumoxide` 0.7, when no `user_data_dir` is specified, defaults to a **fixed** shared path (`/tmp/chromiumoxide-runner`). Every `Browser::launch()` reuses the same Chrome profile directory. This means GitHub session cookies from account 1's OAuth login persist into account 2's browser — GitHub auto-logs in with the wrong account, and all accounts end up with the same `user_id`.
+
+The fix: each `Browser::launch()` is given a unique `user_data_dir` (timestamped temp path). The directory is cleaned up after `browser.close()`.
+
+## Disclaimer
+
+This script is for educational and research purposes only. Please ensure compliance with the relevant website's terms of service before use.
