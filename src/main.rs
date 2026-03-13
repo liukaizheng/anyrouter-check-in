@@ -46,15 +46,21 @@ fn log_account(tag: &str, account_name: &str, message: impl AsRef<str>) {
 
 const BALANCE_HASH_FILE: &str = "balance_hash.txt";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct AccountInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     cookies: SessionCookies,
     api_user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    totp_secret: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct SessionCookies {
     session: String,
 }
@@ -66,6 +72,7 @@ struct UserInfo {
     used_quota: f64,
     display: String,
     error: Option<String>,
+    http_status: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +200,13 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
     {
         Ok(response) => {
             let status = response.status();
+            // print headers for debugging
+            for (key, value) in response.headers() {
+                log_line(
+                    "HTTP",
+                    format!("user info response header: {}: {}", key, value.to_str().unwrap_or("<invalid UTF-8>")),
+                );
+            }
             if status.is_success() {
                 if let Ok(data) = response.json::<Value>().await {
                     if data
@@ -222,6 +236,7 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
                                 quota, used_quota
                             ),
                             error: None,
+                            http_status: Some(status.as_u16()),
                         };
                     }
                 }
@@ -233,6 +248,7 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
                 used_quota: 0.0,
                 display: String::new(),
                 error: Some(format!("user profile request failed: HTTP {}", status)),
+                http_status: Some(status.as_u16()),
             }
         }
         Err(e) => UserInfo {
@@ -241,68 +257,28 @@ async fn get_user_info(client: &Client, headers: &header::HeaderMap) -> UserInfo
             used_quota: 0.0,
             display: String::new(),
             error: Some(format!("user profile request failed: {}", e)),
+            http_status: None,
         },
     }
 }
 
-async fn check_in_account(
-    account_info: &AccountInfo,
-    account_index: usize,
-) -> (bool, Option<UserInfo>) {
-    let account_name = get_account_display_name(account_info, account_index);
-    println!();
-    log_account("ACCOUNT", &account_name, "starting check-in");
-
-    let api_user = &account_info.api_user;
-
-    if api_user.trim().is_empty() {
-        log_account(
-            "ERROR",
-            &account_name,
-            "configuration error: API user identifier is missing or empty",
-        );
-        return (false, None);
-    }
-
-    let mut user_cookies = HashMap::new();
-    user_cookies.insert("session".to_owned(), account_info.cookies.session.clone());
-    if account_info.cookies.session.trim().is_empty() {
-        log_account(
-            "ERROR",
-            &account_name,
-            "configuration error: session cookie is missing or empty",
-        );
-        return (false, None);
-    }
-
-    let waf_cookies = match get_waf_cookies_with_playwright(&account_name).await {
-        Ok(cookies) => cookies,
-        Err(e) => {
-            log_account("ERROR", &account_name, e.to_string());
-            return (false, None);
-        }
-    };
-
+fn build_authenticated_client(
+    waf_cookies: &HashMap<String, String>,
+    session: &str,
+    api_user: &str,
+) -> Result<(Client, header::HeaderMap)> {
     let jar = Arc::new(Jar::default());
+    let url = &"https://anyrouter.top".parse().unwrap();
 
-    for (key, value) in waf_cookies.iter().chain(user_cookies.iter()) {
-        jar.add_cookie_str(
-            &format!("{}={}", key, value),
-            &"https://anyrouter.top".parse().unwrap(),
-        );
+    for (key, value) in waf_cookies {
+        jar.add_cookie_str(&format!("{}={}", key, value), url);
     }
+    jar.add_cookie_str(&format!("session={}", session), url);
 
-    let client = match Client::builder().cookie_provider(jar).build() {
-        Ok(client) => client,
-        Err(e) => {
-            log_account(
-                "ERROR",
-                &account_name,
-                format!("failed to create HTTP client: {}", e),
-            );
-            return (false, None);
-        }
-    };
+    let client = Client::builder()
+        .cookie_provider(jar)
+        .build()
+        .map_err(|e| anyhow!("failed to create HTTP client: {}", e))?;
 
     let mut headers = header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36".parse().unwrap());
@@ -321,8 +297,377 @@ async fn check_in_account(
     headers.insert(header::ORIGIN, "https://anyrouter.top".parse().unwrap());
     headers.insert("new-api-user", api_user.parse().unwrap());
 
-    // Fetch account info before check-in (may fail; non-fatal)
+    Ok((client, headers))
+}
+
+fn generate_totp(secret_base32: &str) -> Result<String> {
+    use data_encoding::BASE32;
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+
+    let normalized = secret_base32.to_uppercase().replace(' ', "");
+    let secret = BASE32
+        .decode(normalized.as_bytes())
+        .map_err(|e| anyhow!("invalid TOTP secret (bad base32): {}", e))?;
+
+    let time_step = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        / 30;
+
+    type HmacSha1 = Hmac<Sha1>;
+    let mut mac =
+        HmacSha1::new_from_slice(&secret).map_err(|e| anyhow!("HMAC error: {}", e))?;
+    mac.update(&time_step.to_be_bytes());
+    let result = mac.finalize().into_bytes();
+
+    let offset = (result[19] & 0x0f) as usize;
+    let code = u32::from_be_bytes([
+        result[offset] & 0x7f,
+        result[offset + 1],
+        result[offset + 2],
+        result[offset + 3],
+    ]) % 1_000_000;
+
+    Ok(format!("{:06}", code))
+}
+
+async fn login_via_github_browser(
+    account_name: &str,
+    github_username: &str,
+    github_password: &str,
+    totp_secret: &str,
+) -> Result<(HashMap<String, String>, String)> {
+    log_account(
+        "ACCOUNT",
+        account_name,
+        "starting browser for GitHub OAuth login",
+    );
+
+    let (mut browser, mut handler) = Browser::launch(
+        BrowserConfig::builder()
+            .window_size(1920, 1080)
+            .build()
+            .map_err(|e| anyhow!("failed to build browser config: {}", e))?,
+    )
+    .await?;
+
+    let handle = tokio::task::spawn(async move { while let Some(_) = handler.next().await {} });
+    let page = browser.new_page("about:blank").await?;
+
+    log_account(
+        "ACCOUNT",
+        account_name,
+        "loading login page for WAF cookies",
+    );
+    page.goto("https://anyrouter.top/login").await?;
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    let cookies = page.get_cookies().await?;
+    let mut waf_cookies = HashMap::new();
+    for cookie in &cookies {
+        if ["acw_tc", "cdn_sec_tc", "acw_sc__v2"].contains(&cookie.name.as_str()) {
+            waf_cookies.insert(cookie.name.clone(), cookie.value.clone());
+        }
+    }
+
+    log_account(
+        "ACCOUNT",
+        account_name,
+        format!("collected {} WAF cookies, initiating GitHub OAuth", waf_cookies.len()),
+    );
+
+    let github_clicked: bool = page
+        .evaluate(
+            r#"(function() {
+                var els = document.querySelectorAll('a, button');
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    var href = el.href || '';
+                    var text = (el.textContent || '').toLowerCase();
+                    if (href.indexOf('oauth/github') !== -1 || href.indexOf('github.com') !== -1 ||
+                        (text.indexOf('github') !== -1 && (el.tagName === 'BUTTON' || el.tagName === 'A'))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+
+    if !github_clicked {
+        log_account(
+            "WARN",
+            account_name,
+            "GitHub login button not found on page, trying direct OAuth endpoint",
+        );
+        page.goto("https://anyrouter.top/api/oauth/github")
+            .await?;
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    let current_url: String = page
+        .evaluate("window.location.href")
+        .await?
+        .into_value()?;
+
+    if current_url.contains("github.com") {
+        log_account(
+            "ACCOUNT",
+            account_name,
+            "on GitHub login page, filling credentials",
+        );
+
+        page.find_element("#login_field")
+            .await?
+            .click()
+            .await?
+            .type_str(github_username)
+            .await?;
+
+        page.find_element("#password")
+            .await?
+            .click()
+            .await?
+            .type_str(github_password)
+            .await?;
+
+        page.find_element("input[name='commit']")
+            .await?
+            .click()
+            .await?;
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        let current_url: String = page
+            .evaluate("window.location.href")
+            .await?
+            .into_value()?;
+
+        if current_url.contains("/sessions/two-factor") || current_url.contains("/2fa") {
+            log_account(
+                "ACCOUNT",
+                account_name,
+                "GitHub 2FA required, generating TOTP code",
+            );
+
+            let code = generate_totp(totp_secret)?;
+
+            page.find_element("#app_totp")
+                .await?
+                .click()
+                .await?
+                .type_str(&code)
+                .await?;
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+
+        let current_url: String = page
+            .evaluate("window.location.href")
+            .await?
+            .into_value()?;
+
+        if current_url.contains("/oauth/authorize") {
+            log_account(
+                "ACCOUNT",
+                account_name,
+                "authorizing OAuth app on GitHub",
+            );
+
+            if let Ok(btn) = page.find_element("#js-oauth-authorize-btn").await {
+                btn.click().await?;
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+    let final_url: String = page
+        .evaluate("window.location.href")
+        .await?
+        .into_value()?;
+
+    if !final_url.contains("anyrouter.top") {
+        browser.close().await?;
+        handle.abort();
+        return Err(anyhow!(
+            "GitHub OAuth login did not redirect back to anyrouter.top (ended at: {})",
+            final_url
+        ));
+    }
+
+    let final_cookies = page.get_cookies().await?;
+    let session = final_cookies
+        .iter()
+        .find(|c| c.name == "session")
+        .map(|c| c.value.clone())
+        .ok_or_else(|| anyhow!("session cookie not found after GitHub OAuth login"))?;
+
+    for cookie in &final_cookies {
+        if ["acw_tc", "cdn_sec_tc", "acw_sc__v2"].contains(&cookie.name.as_str()) {
+            waf_cookies.insert(cookie.name.clone(), cookie.value.clone());
+        }
+    }
+
+    browser.close().await?;
+    handle.abort();
+
+    log_account(
+        "SUCCESS",
+        account_name,
+        "GitHub OAuth login successful, session obtained",
+    );
+
+    Ok((waf_cookies, session))
+}
+
+async fn update_accounts_in_cloudflare(accounts: &[AccountInfo]) -> Result<()> {
+    let client = reqwest::Client::new();
+    let auth_header = sha256_hex(&env::var("AUTH_VALUE")?);
+
+    let resp = client
+        .put("https://kv-tutorial.cazean.workers.dev/")
+        .query(&[("key", "anyrouter-accounts")])
+        .header("x-auth", auth_header)
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(accounts)
+        .send()
+        .await?;
+
+    match resp.status() {
+        status if status.is_success() => Ok(()),
+        status => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(anyhow!(
+                "failed to update Cloudflare KV: HTTP {} - {}",
+                status,
+                body
+            ))
+        }
+    }
+}
+
+async fn check_in_account(
+    account_info: &mut AccountInfo,
+    account_index: usize,
+) -> (bool, Option<UserInfo>, bool) {
+    let account_name = get_account_display_name(account_info, account_index);
+    println!();
+    log_account("ACCOUNT", &account_name, "starting check-in");
+
+    let api_user = account_info.api_user.clone();
+    let mut session_updated = false;
+
+    if api_user.trim().is_empty() {
+        log_account(
+            "ERROR",
+            &account_name,
+            "configuration error: API user identifier is missing or empty",
+        );
+        return (false, None, false);
+    }
+
+    if account_info.cookies.session.trim().is_empty() {
+        if account_info.github_username.is_some()
+            && account_info.github_password.is_some()
+            && account_info.totp_secret.is_some()
+        {
+            log_account(
+                "INFO",
+                &account_name,
+                "session cookie is empty, will attempt GitHub OAuth login",
+            );
+        } else {
+            log_account(
+                "ERROR",
+                &account_name,
+                "configuration error: session cookie is missing and no GitHub login credentials configured",
+            );
+            return (false, None, false);
+        }
+    }
+
+    let waf_cookies = match get_waf_cookies_with_playwright(&account_name).await {
+        Ok(cookies) => cookies,
+        Err(e) => {
+            log_account("ERROR", &account_name, e.to_string());
+            return (false, None, false);
+        }
+    };
+
+    let (mut client, mut headers) =
+        match build_authenticated_client(&waf_cookies, &account_info.cookies.session, &api_user) {
+            Ok(result) => result,
+            Err(e) => {
+                log_account("ERROR", &account_name, e.to_string());
+                return (false, None, false);
+            }
+        };
+
     let mut user_info = get_user_info(&client, &headers).await;
+
+    if !user_info.success && user_info.http_status == Some(401) {
+        if let (Some(ref github_username), Some(ref github_password), Some(ref totp_secret)) = (
+            account_info.github_username.clone(),
+            account_info.github_password.clone(),
+            account_info.totp_secret.clone(),
+        ) {
+            log_account(
+                "ACCOUNT",
+                &account_name,
+                "session expired (HTTP 401), attempting GitHub OAuth login",
+            );
+            match login_via_github_browser(&account_name, github_username, github_password, totp_secret).await {
+                Ok((new_waf_cookies, new_session)) => {
+                    log_account(
+                        "SUCCESS",
+                        &account_name,
+                        "GitHub OAuth login successful, session renewed",
+                    );
+                    account_info.cookies.session = new_session;
+                    session_updated = true;
+
+                    match build_authenticated_client(
+                        &new_waf_cookies,
+                        &account_info.cookies.session,
+                        &api_user,
+                    ) {
+                        Ok((new_client, new_headers)) => {
+                            client = new_client;
+                            headers = new_headers;
+                        }
+                        Err(e) => {
+                            log_account("ERROR", &account_name, e.to_string());
+                            return (false, None, session_updated);
+                        }
+                    }
+
+                    user_info = get_user_info(&client, &headers).await;
+                }
+                Err(e) => {
+                    log_account(
+                        "ERROR",
+                        &account_name,
+                        format!("GitHub OAuth login failed: {}", e),
+                    );
+                    return (false, None, false);
+                }
+            }
+        } else {
+            log_account(
+                "WARN",
+                &account_name,
+                "session expired but no GitHub login credentials configured for auto-renewal",
+            );
+            return (false, Some(user_info), false);
+        }
+    }
+
     if user_info.success {
         log_account(
             "BALANCE",
@@ -381,7 +726,6 @@ async fn check_in_account(
                                 "check-in completed successfully",
                             );
 
-                            // Attempt to refresh account info after a successful check-in
                             let post_user_info = get_user_info(&client, &headers).await;
                             if post_user_info.success {
                                 log_account(
@@ -401,7 +745,7 @@ async fn check_in_account(
                                 );
                             }
 
-                            (true, Some(user_info))
+                            (true, Some(user_info), session_updated)
                         } else {
                             let error_msg = result
                                 .get("msg")
@@ -413,7 +757,7 @@ async fn check_in_account(
                                 &account_name,
                                 format!("check-in failed: {}", error_msg),
                             );
-                            (false, Some(user_info))
+                            (false, Some(user_info), session_updated)
                         }
                     }
                     Err(_) => {
@@ -422,7 +766,7 @@ async fn check_in_account(
                             &account_name,
                             "check-in failed: invalid JSON response from server",
                         );
-                        (false, Some(user_info))
+                        (false, Some(user_info), session_updated)
                     }
                 }
             } else {
@@ -431,7 +775,7 @@ async fn check_in_account(
                     &account_name,
                     format!("check-in failed: HTTP {}", response.status()),
                 );
-                (false, Some(user_info))
+                (false, Some(user_info), session_updated)
             }
         }
         Err(e) => {
@@ -440,7 +784,7 @@ async fn check_in_account(
                 &account_name,
                 format!("check-in failed: network error {}", e),
             );
-            (false, None)
+            (false, None, session_updated)
         }
     }
 }
@@ -483,7 +827,7 @@ async fn main() -> Result<()> {
         ),
     );
 
-    let accounts = get_account_from_cloudflare().await?;
+    let mut accounts = get_account_from_cloudflare().await?;
     log_line(
         "INFO",
         format!("Found {} account configurations", accounts.len()),
@@ -497,11 +841,16 @@ async fn main() -> Result<()> {
     let mut current_balances: HashMap<String, BalanceInfo> = HashMap::new();
     let mut need_notify = false;
     let mut balance_changed = false;
+    let mut any_session_updated = false;
 
-    for (i, account) in accounts.iter().enumerate() {
+    for (i, account) in accounts.iter_mut().enumerate() {
         let account_key = format!("account_{}", i + 1);
 
-        let (success, user_info) = check_in_account(account, i).await;
+        let (success, user_info, session_updated) = check_in_account(account, i).await;
+
+        if session_updated {
+            any_session_updated = true;
+        }
 
         if success {
             success_count += 1;
@@ -558,6 +907,16 @@ async fn main() -> Result<()> {
             );
 
             notification_content.push(account_result);
+        }
+    }
+
+    if any_session_updated {
+        match update_accounts_in_cloudflare(&accounts).await {
+            Ok(_) => log_line("SUCCESS", "renewed session cookies persisted to Cloudflare KV"),
+            Err(e) => log_line(
+                "ERROR",
+                format!("failed to persist renewed sessions to Cloudflare KV: {}", e),
+            ),
         }
     }
 
